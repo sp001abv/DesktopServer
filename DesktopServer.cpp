@@ -9,15 +9,9 @@
 #include <ws2tcpip.h>
 #pragma comment (lib, "Ws2_32.lib")
 
-#include <ntsecapi.h>
-#pragma comment (lib, "Secur32.lib")
-
-
-
 #include "DesktopServer.h"
 
 #define MAX_LOADSTRING 100
-//#define USE_MF
 
 
 // Global Variables:
@@ -89,7 +83,7 @@ ATOM MyRegisterClass(HINSTANCE hInstance)
     wcex.hInstance      = hInstance;
     wcex.hIcon          = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_DESKTOPSERVER));
     wcex.hCursor        = LoadCursor(nullptr, IDC_ARROW);
-    wcex.hbrBackground  = (HBRUSH)(COLOR_WINDOW+1);
+    wcex.hbrBackground  = (HBRUSH)(COLOR_WINDOW +1);
     wcex.lpszMenuName   = MAKEINTRESOURCEW(IDC_DESKTOPSERVER);
     wcex.lpszClassName  = szWindowClass;
     wcex.hIconSm        = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_SMALL));
@@ -403,7 +397,7 @@ void Read()
 
 			SendInput(1, &input, sizeof(input));
 
-			sprintf_s(Log(), "key %X  %d  %c %d", code, code, code, type);
+			//sprintf_s(Log(), "key %X  %d  %c %d", code, code, code, type);
 		}
 	}
 }
@@ -474,6 +468,7 @@ void Capture()
 	UINT size = 0;
 	UINT color = skip;
 	HRESULT hr = S_OK; 
+	int updatedPixels = 0;
 
 	for (int i = 0; i < m_screenSize; i++)
 	{
@@ -496,7 +491,7 @@ void Capture()
 			else n = 1;
 			size += n;
 			if (color != skip)
-				m_updatedPixels += n;
+				updatedPixels += n;
 			n = 0;
 			if (color != skip)
 				buffer[index++] = color >> 8;
@@ -513,15 +508,18 @@ void Capture()
 		n++;
 	}
 
-	if (index > 0) {
-		SendData(buffer, index);
-		m_sentBytes += index;
+	if (updatedPixels) {
+		if (index) {
+			SendData(buffer, index);
+			m_sentBytes += index;
+		}
+		m_updatedPixels += updatedPixels;
+		m_sentFrames++;
 	}
-
-	m_sentFrames++;
 
 	GlobalUnlock(m_screenDIB);
 	GlobalUnlock(m_screenBuffer);
+
 }
 
 void Send(LPVOID p)
@@ -543,28 +541,35 @@ void Send(LPVOID p)
 		}
 		else if (m_startTime > 0)
 		{
-			static DWORD s_tick = GetTickCount();
-			DWORD tick = GetTickCount();
+			static LONGLONG s_tick = GetTickCount64();
+			static LONGLONG s_sentBytes = 0;
+			static LONGLONG s_sentFrames = 0;
+			LONGLONG tick = GetTickCount64();
 			Capture();
-			if (tick - s_tick >= 1000)
+			DWORD bps = (DWORD)(m_sentBytes - s_sentBytes);
+			DWORD fps = (DWORD)(m_sentFrames - s_sentFrames);
+			DWORD bpf = fps ? bps / fps : 0;
+			if (GetTickCount64() - s_tick >= 1000)
 			{
-				static LONGLONG s_sentBytes = 0;
-				static LONGLONG s_updatedFrames = 0;
-				LONGLONG time = m_startTime ? (GetTickCount64() - m_startTime) / 1000 : 0;
-				LONGLONG bps = m_sentBytes - s_sentBytes;
-				LONGLONG fps = m_sentFrames - s_updatedFrames;
-				LONGLONG bpf = fps ? bps / fps : 0;
-				sprintf_s(m_szText, "pixels %llu bytes %llu/%llu frames %llu time %llu bpf %llu  bps %llu fps %llu",
+				LONGLONG time = tick - m_startTime;
+				sprintf_s(m_szText, "pixels %llu bytes %llu/%llu frames %llu time %llu bpf %d  bps %d fps %d",
 					m_updatedPixels, m_sentBytes, m_receivedBytes, m_sentFrames, time, bpf, bps, fps);
 				s_tick = tick;
 				s_sentBytes = m_sentBytes;
-				s_updatedFrames = m_sentFrames;
+				s_sentFrames = m_sentFrames;
 				InvalidateRect(hWnd, NULL, TRUE);
 			}
-			DWORD ticks = GetTickCount() - tick;
-			if (ticks < 200) {
-				Sleep(200 - ticks);
+			if (bpf > 0) {
+				DWORD frameTicks = bpf / 500;
+				if (frameTicks < 125)
+					frameTicks = 125;
+				DWORD ticks = (DWORD)(GetTickCount64() - tick);
+				if (ticks < frameTicks) {
+					Sleep(frameTicks - ticks);
+				}
 			}
+			else
+				Sleep(50);
 		}
 	}
 }
@@ -652,12 +657,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			GetClientRect(hWnd, &rcClient);
 			PAINTSTRUCT ps;
 			HDC hdc = BeginPaint(hWnd, &ps);
-			DrawTextA(hdc, m_szText, strlen(m_szText), &rcClient, DT_CENTER);
+			DrawTextA(hdc, m_szText, (int)strlen(m_szText), &rcClient, DT_CENTER);
 			for (int i = 0; i < LOGS; i++) {
 				rcClient.top += 16;
 				LOG& log = m_szLog[(m_logi + i + 1) % LOGS];
 				if (log[0])
-					DrawTextA(hdc, log, strlen(log), &rcClient, DT_LEFT);
+					DrawTextA(hdc, log, (int)strlen(log), &rcClient, DT_LEFT);
 			}
 			EndPaint(hWnd, &ps);
 		}
