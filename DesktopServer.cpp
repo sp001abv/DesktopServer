@@ -101,7 +101,9 @@ int m_logi = 0;
 HDC m_screenMemoryDC = NULL;
 HBITMAP m_screenBitmap = NULL;
 HANDLE m_screenDIB = NULL;
-HANDLE m_screenBuffer = NULL;
+UINT* m_screenDIBBuffer = NULL;
+UCHAR* m_screenSendBuffer = NULL;
+int m_screenSendBufferSize = 0;
 int m_screenWidth = 0;
 int m_screenHeight = 0;
 int m_screenSize = m_screenWidth * m_screenHeight;
@@ -147,14 +149,33 @@ void InitScreenMem()
 	ReleaseDC(NULL, hdcScreen);
 
 	if (m_screenDIB) GlobalFree(m_screenDIB);
-	if (m_screenBuffer) GlobalFree(m_screenBuffer);
+	if (m_screenDIBBuffer) free(m_screenDIBBuffer);
+	if (m_screenSendBuffer) free(m_screenSendBuffer);
 
-	m_screenDIB = GlobalAlloc(GHND, m_screenSize * 4);
-	m_screenBuffer = GlobalAlloc(GHND, m_screenSize * 4);
+	size_t size = m_screenSize * 4;
+	m_screenDIB = GlobalAlloc(GHND, size);
+	m_screenDIBBuffer = (UINT*)malloc(size);
+	m_screenSendBuffer = (UCHAR*)malloc(size);
 }
 
 SOCKET m_clientScreenSocket = INVALID_SOCKET;
 SOCKET m_listenScreenSocket = INVALID_SOCKET;
+
+inline bool IsDisconnected(const SOCKET& socket)
+{
+	return socket == INVALID_SOCKET;
+}
+
+inline bool IsConnected(const SOCKET& socket)
+{
+	return socket != INVALID_SOCKET;
+}
+
+void Close(SOCKET& socket, int how)
+{
+	shutdown(socket, how);
+	socket = INVALID_SOCKET;
+}
 
 
 HRESULT InitSocketSystem()
@@ -248,34 +269,40 @@ HRESULT InitSocket(SOCKET& listenSocket, UINT port)
 }
 
 
-HRESULT SendData(SOCKET& socket, const void* data, DWORD dataLength)
+HRESULT SendBytes(SOCKET& socket, const void* bytes, DWORD size)
 {
 	HRESULT hr = S_OK;
 	int sendResult = 0;
 
-	sendResult = send(socket, (const char*)data, dataLength, 0);
+	sendResult = send(socket, (const char*)bytes, size, 0);
 	if (sendResult == SOCKET_ERROR)
 	{
 		hr = HRESULT_FROM_WIN32(WSAGetLastError());
-		shutdown(socket, SD_SEND);
-		socket = INVALID_SOCKET;
+		Close(socket, SD_SEND);
 		return hr;
 	}
+	m_sentBytes += size;
 	return hr;
 }
 
-bool ReadBytes(SOCKET& socket, char * buf, int size)
+template<typename T>
+bool send(SOCKET& socket, T& t)
 {
-	int result = recv(socket, buf, size, MSG_WAITALL);
+	return SendBytes(socket, &t, sizeof(t));
+}
+
+
+bool ReadBytes(SOCKET& socket, char * bytes, int size)
+{
+	int result = recv(socket, bytes, size, MSG_WAITALL);
 	if (result == SOCKET_ERROR)
 	{
-		HRESULT hr = HRESULT_FROM_WIN32(WSAGetLastError());
-		shutdown(socket, SD_SEND);
-		socket = INVALID_SOCKET;
+		//HRESULT hr = HRESULT_FROM_WIN32(WSAGetLastError());
+		Close(socket, SD_BOTH);
 		return false;
 	}
 	m_receivedBytes += result;
-	return true;
+	return result;
 }
 
 template<typename T>
@@ -326,6 +353,18 @@ bool map(WORD& c1, WORD& c2, CODEMAP m[])
 	return false;
 }
 
+void MouseWheel(DWORD data)
+{
+	INPUT input;
+	input.type = INPUT_MOUSE;
+	input.mi.dx = input.mi.dy = 0;
+	input.mi.dwFlags = input.mi.mouseData = input.mi.time = 0;
+	input.mi.dwExtraInfo = 0;
+	input.mi.mouseData = data * 120;
+	input.mi.dwFlags = MOUSEEVENTF_WHEEL;
+	SendInput(1, &input, sizeof(input));
+}
+
 void ReadDesktopControl()
 {
 
@@ -337,11 +376,8 @@ void ReadDesktopControl()
 		DWORD data = 0;
 		INPUT input;
 		input.type = INPUT_MOUSE;
-		input.mi.dx = 0;
-		input.mi.dy = 0;
-		input.mi.dwFlags = 0;
-		input.mi.mouseData = 0;
-		input.mi.time = 0;
+		input.mi.dx = input.mi.dy = 0;
+		input.mi.dwFlags = input.mi.mouseData = input.mi.time = 0;
 		input.mi.dwExtraInfo = 0;
 
 		switch (type)
@@ -424,31 +460,11 @@ HRESULT Accept(SOCKET& clientSocket,const SOCKET& listenSocket)
 	return hr;
 }
 
-void InitScreenCapture() 
+bool m_sendAudio = false;
+bool m_captureScreen = true;
+
+void GetScreenDIB(UINT* screenDIB)
 {
-	InitScreenMem();
-
-	int dim = m_screenWidth << 16 | m_screenHeight;
-	SendData(m_clientScreenSocket, &dim, sizeof(dim));
-
-	UINT* buffer = (UINT*)GlobalLock(m_screenBuffer);
-	memset(buffer, 0, m_screenSize * 4);
-	GlobalUnlock(m_screenBuffer);
-
-	m_startTime = GetTickCount64();
-}
-
-inline bool IsSocketDisconnected(const SOCKET& socket)
-{
-	return socket == INVALID_SOCKET;
-}
-
-void CaptureScreen()
-{
-	HDC screenDC = GetDC(NULL);
-	BitBlt(m_screenMemoryDC, 0, 0, m_screenWidth, m_screenHeight, screenDC, 0, 0, SRCCOPY);
-	ReleaseDC(NULL, screenDC);
-
 	BITMAPINFOHEADER   bi;
 
 	bi.biSize = sizeof(BITMAPINFOHEADER);
@@ -463,26 +479,42 @@ void CaptureScreen()
 	bi.biClrUsed = 0;
 	bi.biClrImportant = 0;
 
-	UINT* screenDIB = (UINT*)GlobalLock(m_screenDIB);
-	UINT* sceenBuffer = (UINT*)GlobalLock(m_screenBuffer);
+	GetDIBits(m_screenMemoryDC, m_screenBitmap, 0, (UINT)m_screenHeight, screenDIB, (BITMAPINFO*)&bi, DIB_RGB_COLORS);
+}
 
-	GetDIBits(m_screenMemoryDC, m_screenBitmap, 0, (UINT)m_screenHeight, screenDIB, (BITMAPINFO *)&bi, DIB_RGB_COLORS);
+void InitScreenDC()
+{
+	RECT rc = { 0, 0 , m_screenWidth, m_screenHeight };
+	LPCSTR info = "Screen Capture Stopped";
+	SelectObject(m_screenMemoryDC, GetStockObject(BLACK_BRUSH));
+	SetBkColor(m_screenMemoryDC, 0);
+	SetTextColor(m_screenMemoryDC, 0xFFFFF);
+	Rectangle(m_screenMemoryDC, rc.left, rc.top, rc.right, rc.bottom);
+	DrawTextA(m_screenMemoryDC, info, (int)strlen(info), &rc, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+}
+
+bool GetScreenBuffer()
+{
+	UINT* screenDIB = (UINT*)GlobalLock(m_screenDIB);
+	UINT* screenBuffer = m_screenDIBBuffer;
+
+	GetScreenDIB(screenDIB);
 
 	const UINT skip = 0xFFFF;
-	UCHAR buffer[512];
+	UCHAR* buffer = m_screenSendBuffer;
 	UINT index = 0;
 	UINT n = 0;
 	UINT size = 0;
 	UINT color = skip;
-	HRESULT hr = S_OK; 
+	HRESULT hr = S_OK;
 	int updatedPixels = 0;
 
 	for (int i = 0; i < m_screenSize; i++)
 	{
-		UINT c;
-		if (sceenBuffer[i] != screenDIB[i]) {
-			c = sceenBuffer[i] = screenDIB[i];
-			c = (c & 0xF80000) >> 9 | (c & 0xF800) >> 6 | (c & 0xF8) >> 3;
+		UINT c = screenDIB[i];
+		c = (c & 0xF80000) >> 9 | (c & 0xF800) >> 6 | (c & 0xF8) >> 3;
+		if (screenBuffer[i] != c) {
+			screenBuffer[i] = c;
 		}
 		else {
 			c = skip;
@@ -498,44 +530,91 @@ void CaptureScreen()
 			else n = 1;
 			size += n;
 			if (color != skip)
+			{
 				updatedPixels += n;
-			n = 0;
-			if (color != skip)
 				buffer[index++] = color >> 8;
-			buffer[index++] = color;
-			if (index >= sizeof(buffer) - 8) {
-				hr = SendData(m_clientScreenSocket, buffer, index);
-				m_sentBytes += index;
-				index = 0;
-				if (hr != S_OK)
-					break;
 			}
+			buffer[index++] = color;
+			n = 0;
 		}
 		color = c;
 		n++;
 	}
 
-	if (updatedPixels) {
-		if (index) {
-			SendData(m_clientScreenSocket, buffer, index);
-			m_sentBytes += index;
+	GlobalUnlock(m_screenDIB);
+
+	m_screenSendBufferSize = index;
+	m_updatedPixels += updatedPixels;
+
+	return updatedPixels > 0;
+}
+
+void SendScreenBuffer()
+{
+	SendBytes(m_clientScreenSocket, m_screenSendBuffer, m_screenSendBufferSize);
+	m_sentFrames++;
+}
+
+void InitScreenCapture() 
+{
+	InitScreenMem();
+
+	int dim = m_screenWidth << 16 | m_screenHeight;
+	send(m_clientScreenSocket, dim);
+	char sendAudio = (char)(m_sendAudio ? 1 : 0);
+	send(m_clientScreenSocket, sendAudio);
+
+	memset(m_screenDIBBuffer, 0, m_screenSize * 4);
+
+	m_updatedPixels = m_sentBytes = m_receivedBytes = m_sentFrames = 0;
+	m_startTime = GetTickCount64();
+
+	if (!m_captureScreen)
+	{
+		InitScreenDC();
+		GetScreenBuffer();
+		SendScreenBuffer();
+		GetScreenBuffer();
+	}
+}
+
+void CaptureScreen()
+{	
+	bool screenUpdated = false;
+	if (m_captureScreen)
+	{
+		HDC screenDC = GetDC(NULL);
+		m_captureScreen = BitBlt(m_screenMemoryDC, 0, 0, m_screenWidth, m_screenHeight, screenDC, 0, 0, SRCCOPY);
+		ReleaseDC(NULL, screenDC);
+		if (m_captureScreen)
+		{
+			screenUpdated = GetScreenBuffer();
 		}
-		m_updatedPixels += updatedPixels;
-		m_sentFrames++;
+		else
+		{
+			InitScreenDC();
+			GetScreenBuffer();
+			SendScreenBuffer();
+			GetScreenBuffer();
+		}
+
 	}
 
-	GlobalUnlock(m_screenDIB);
-	GlobalUnlock(m_screenBuffer);
-
+	static int s_count = 0;
+	if (screenUpdated || ++s_count == 10)
+	{
+		SendScreenBuffer();
+		s_count = 0;
+	}
 }
 
 void SendScreen(LPVOID p)
 {
 	HWND hWnd = (HWND)p;
+	static LONGLONG s_tick = 0;
 	while (m_running) {
-		if (IsSocketDisconnected(m_clientScreenSocket))
+		if (IsDisconnected(m_clientScreenSocket))
 		{
-			m_startTime = m_updatedPixels = m_sentBytes = m_receivedBytes = m_sentFrames = 0;
 			if (m_szText[0]) {
 				m_szText[0] = 0;
 				InvalidateRect(hWnd, NULL, TRUE);
@@ -544,11 +623,21 @@ void SendScreen(LPVOID p)
 				InitLog();
 				InvalidateRect(hWnd, NULL, TRUE);
 			}
+
+			if (s_tick >= 149)
+				s_tick = 0;
+			else
+				s_tick++;
+
+			if (s_tick % 30 == 0)
+				MouseWheel(-2);
+			else if (s_tick == 130)
+				MouseWheel(4);
+			
 			Sleep(200);
 		}
 		else if (m_startTime > 0)
 		{
-			static LONGLONG s_tick = GetTickCount64();
 			static LONGLONG s_sentBytes = 0;
 			static DWORD s_sentFrames = 0;
 			LONGLONG tick = GetTickCount64();
@@ -556,27 +645,23 @@ void SendScreen(LPVOID p)
 			DWORD bps = (DWORD)(m_sentBytes - s_sentBytes);
 			DWORD fps = m_sentFrames - s_sentFrames;
 			DWORD bpf = fps ? bps / fps : 0;
-			if (GetTickCount64() - s_tick >= 1000)
+			if (tick - s_tick >= 1000)
 			{
 				DWORD time = (DWORD)((tick - m_startTime) / 1000);
-				sprintf_s(m_szText, "pixels %5.3fM sent %5.3fMB received %5.3fKB frames %d time %02d:%02d bpf %d bps %d fps %d",
-					(float)m_updatedPixels/(1000*1000), (float)m_sentBytes/(1024 *1024), (float)m_receivedBytes/1024, m_sentFrames, time/60, time%60, bpf, bps, fps);
+				sprintf_s(m_szText, "pixels %5.3fM sent %5.3fMB received %5.3fMB frames %d time %02d:%02d bpf %d bps %d fps %d",
+					(float)m_updatedPixels/(1000*1000), (float)m_sentBytes/ (float)(1024 *1024), (float)m_receivedBytes/(float)(1024*1024), m_sentFrames, time/60, time%60, bpf, bps, fps);
 				s_tick = tick;
 				s_sentBytes = m_sentBytes;
 				s_sentFrames = m_sentFrames;
 				InvalidateRect(hWnd, NULL, TRUE);
 			}
-			if (bpf > 0) {
-				DWORD frameTicks = bpf / 500;
-				if (frameTicks < 125)
-					frameTicks = 125;
-				DWORD ticks = (DWORD)(GetTickCount64() - tick);
-				if (ticks < frameTicks) {
-					Sleep(frameTicks - ticks);
-				}
+			DWORD frameTicks = bpf / 500;
+			if (frameTicks < 125)
+				frameTicks = 125;
+			DWORD ticks = (DWORD)(GetTickCount64() - tick);
+			if (ticks < frameTicks) {
+				Sleep(frameTicks - ticks);
 			}
-			else
-				Sleep(50);
 		}
 	}
 }
@@ -584,15 +669,18 @@ void SendScreen(LPVOID p)
 void ReceiveDesktopControl(LPVOID p)
 {
 	while (m_running) {
-		if (IsSocketDisconnected(m_clientScreenSocket)) {
-			if (Accept(m_clientScreenSocket, m_listenScreenSocket) == S_OK)
+		if (IsDisconnected(m_clientScreenSocket)) {
+			if (Accept(m_clientScreenSocket, m_listenScreenSocket) == S_OK) {
+				//system("tscon console");
 				InitScreenCapture();
+			}
 		}
 		else
 			ReadDesktopControl();
 	}
 }
 
+#define REMOTE_AUDIO
 #ifdef REMOTE_AUDIO
 
 #include <audioclient.h>
@@ -605,16 +693,49 @@ SOCKET m_listenAudioSocket = INVALID_SOCKET;
 #define REFTIMES_PER_MILLISEC  10000
 
 
-#define EXIT_ON_ERROR(hres) if (FAILED(hres)) { goto Exit; }
-#define SAFE_RELEASE(punk)  if ((punk) != NULL) { (punk)->Release(); (punk) = NULL; }
+#define EXIT_ON_ERROR(hres) if (FAILED(hres)) goto Exit;
+#define SAFE_RELEASE(punk)  if ((punk) != NULL) (punk)->Release();
 
 const CLSID CLSID_MMDeviceEnumerator = __uuidof(MMDeviceEnumerator);
 const IID IID_IMMDeviceEnumerator = __uuidof(IMMDeviceEnumerator);
 const IID IID_IAudioClient = __uuidof(IAudioClient);
 const IID IID_IAudioCaptureClient = __uuidof(IAudioCaptureClient);
+const IID IID_IAudioRenderClient = __uuidof(IAudioRenderClient);
 
-void SendAudio(LPVOID)
+//typedef char SAMPLE;
+typedef short SAMPLE;
+const char sampleBits = sizeof(SAMPLE) * 8;
+const short sampleRate = 16000;
+const float sampleMax = (float)((1 << (sampleBits - 1)) - 1);
+bool m_playAudio = false;
+
+void LogFormat(WAVEFORMATEX* pwfx, HWND hWnd)
 {
+	WAVEFORMATEXTENSIBLE* pwfe = (WAVEFORMATEXTENSIBLE*)pwfx;
+
+	sprintf_s(Log(), "format %X, channels %d, samples %d, bits %d, block %d, abps %d, cbs %d",
+		pwfx->wFormatTag, pwfx->nChannels, pwfx->nSamplesPerSec, pwfx->wBitsPerSample, pwfx->nBlockAlign, pwfx->nAvgBytesPerSec, pwfx->cbSize);
+	const char * format = "";
+	if (KSDATAFORMAT_SUBTYPE_PCM == pwfe->SubFormat)
+		format = "KSDATAFORMAT_SUBTYPE_PCM";
+	else if (KSDATAFORMAT_SUBTYPE_IEEE_FLOAT == pwfe->SubFormat)
+		format = "KSDATAFORMAT_SUBTYPE_IEEE_FLOAT";
+	else if (KSDATAFORMAT_SUBTYPE_DRM == pwfe->SubFormat)
+		format = "KSDATAFORMAT_SUBTYPE_DRM";
+	else if (KSDATAFORMAT_SUBTYPE_ALAW == pwfe->SubFormat)
+		format = "KSDATAFORMAT_SUBTYPE_ALAW";
+	else if (KSDATAFORMAT_SUBTYPE_MULAW == pwfe->SubFormat)
+		format = "KSDATAFORMAT_SUBTYPE_MULAW";
+	else if (KSDATAFORMAT_SUBTYPE_ADPCM == pwfe->SubFormat)
+		format = "KSDATAFORMAT_SUBTYPE_ADPCM";
+
+	sprintf_s(Log(), "format %s, bits %d, samples %d, mask %d", format, pwfe->Samples.wValidBitsPerSample, pwfe->Samples.wSamplesPerBlock, pwfe->dwChannelMask);
+	InvalidateRect(hWnd, NULL, TRUE);
+}
+
+void SendAudio(LPVOID p)
+{
+	HWND hWnd = (HWND)p;
 	HRESULT hr;
 	REFERENCE_TIME hnsRequestedDuration = REFTIMES_PER_SEC;
 	REFERENCE_TIME hnsActualDuration;
@@ -635,7 +756,7 @@ void SendAudio(LPVOID)
 		(void**)&pEnumerator);
 	EXIT_ON_ERROR(hr)
 
-	hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
+	hr = pEnumerator->GetDefaultAudioEndpoint(eRender, m_playAudio ? eCommunications : eConsole, &pDevice);
 	EXIT_ON_ERROR(hr)
 
 	hr = pDevice->Activate(IID_IAudioClient, CLSCTX_ALL,	NULL, (void**)&pAudioClient);
@@ -643,28 +764,12 @@ void SendAudio(LPVOID)
 
 	WAVEFORMATEX* pwfx;
 	hr = pAudioClient->GetMixFormat(&pwfx);
-	WAVEFORMATEXTENSIBLE* pwfe = (WAVEFORMATEXTENSIBLE*)pwfx;
 
-	sprintf_s(Log(), "format %X, channels %d, samples %d, bits %d, block %d, abps %d, cbs %d",
-		pwfx->wFormatTag, pwfx->nChannels, pwfx->nSamplesPerSec, pwfx->wBitsPerSample, pwfx->nBlockAlign, pwfx->nAvgBytesPerSec, pwfx->cbSize);
+	sprintf_s(Log(), "sending at %d Hz", sampleRate);
+	LogFormat(pwfx, hWnd);
+	InvalidateRect(hWnd, NULL, TRUE);
 
-	const char * format = "";
-	if (KSDATAFORMAT_SUBTYPE_PCM == pwfe->SubFormat)
-		format = "KSDATAFORMAT_SUBTYPE_PCM";
-	else if (KSDATAFORMAT_SUBTYPE_IEEE_FLOAT == pwfe->SubFormat)
-		format = "KSDATAFORMAT_SUBTYPE_IEEE_FLOAT";
-	else if (KSDATAFORMAT_SUBTYPE_DRM == pwfe->SubFormat)
-		format = "KSDATAFORMAT_SUBTYPE_DRM";
-	else if (KSDATAFORMAT_SUBTYPE_ALAW == pwfe->SubFormat)
-		format = "KSDATAFORMAT_SUBTYPE_ALAW";
-	else if (KSDATAFORMAT_SUBTYPE_MULAW == pwfe->SubFormat)
-		format = "KSDATAFORMAT_SUBTYPE_MULAW";
-	else if (KSDATAFORMAT_SUBTYPE_ADPCM == pwfe->SubFormat)
-		format = "KSDATAFORMAT_SUBTYPE_ADPCM";
-
-	sprintf_s(Log(),"format %s, bits %d, samples %d, mask %d", format, pwfe->Samples.wValidBitsPerSample, pwfe->Samples.wSamplesPerBlock, pwfe->dwChannelMask);
-	
-	hr = pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED,	AUDCLNT_STREAMFLAGS_LOOPBACK, hnsRequestedDuration,	0, pwfx, NULL);
+	hr = pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, hnsRequestedDuration,	0, pwfx, NULL);
 	EXIT_ON_ERROR(hr)
 
 	// Get the size of the allocated buffer.
@@ -681,10 +786,21 @@ void SendAudio(LPVOID)
 	EXIT_ON_ERROR(hr)
 
 	// Each loop fills about half of the shared buffer.
-	while (true)
+	DWORD wait = (DWORD) (hnsActualDuration / REFTIMES_PER_MILLISEC / 8);
+	DWORD tick = GetTickCount();
+	char channels = m_playAudio ? 1 : 2; 
+	SAMPLE samples[sampleRate];
+	send(m_clientAudioSocket, channels);
+	send(m_clientAudioSocket, sampleBits);
+	send(m_clientAudioSocket, sampleRate);
+	char sendAudio = (char)(m_playAudio ? 1 : 0);
+	send(m_clientAudioSocket, sendAudio);
+
+	while (IsConnected(m_clientAudioSocket))
 	{
 		// Sleep for half the buffer duration.
-		Sleep((DWORD)(hnsActualDuration / REFTIMES_PER_MILLISEC / 2));
+		Sleep(wait - (GetTickCount() - tick));
+		tick = GetTickCount();
 
 		hr = pCaptureClient->GetNextPacketSize(&packetLength);
 		EXIT_ON_ERROR(hr)
@@ -705,18 +821,29 @@ void SendAudio(LPVOID)
 			}
 			else
 			{
-				char buffer[8000];
-				int shrink = pwfx->nSamplesPerSec / 8000;
-				numFramesAvailable /= shrink;
-				shrink *= 2;
+				int deflate = pwfx->nSamplesPerSec / sampleRate;
+				int size = numFramesAvailable / deflate * channels;
+				deflate *= pwfx->nChannels;
+				bool silence = true;
 				float* frame = (float*)pData;
-				for (UINT i = 0; i < numFramesAvailable; i++) {
-					buffer[i] = (char)(*frame);
-					frame += shrink;
+				for (int i = 0; i < size; i += channels) {
+					SAMPLE sample = (SAMPLE)((*frame) * sampleMax);
+					samples[i] = sample;
+					if (silence && sample >> 2) silence = false;
+					sample = (SAMPLE)((*(frame + 1)) * sampleMax);
+					if (silence && sample >> 2) silence = false;
+					if (channels == 2)
+						samples[i + 1] = sample;
+					else if (sample)
+						samples[i] = (SAMPLE)(((int)samples[i] + (int)sample) >> 1);
+					frame += deflate;
 				}
-				// Copy the available capture data to the audio sink.
-				hr = SendData(m_clientAudioSocket, buffer, numFramesAvailable);
-				EXIT_ON_ERROR(hr)
+				if (!silence) {
+					hr = SendBytes(m_clientAudioSocket, samples, size * sizeof(SAMPLE));
+					EXIT_ON_ERROR(hr)
+					//sprintf_s(m_szText, "sent %dKB", (UINT)(m_sentBytes / 1024));
+					//InvalidateRect(hWnd, NULL, TRUE);
+				}
 			}
 
 			hr = pCaptureClient->ReleaseBuffer(numFramesAvailable);
@@ -736,21 +863,168 @@ Exit:
 	SAFE_RELEASE(pDevice)
 	SAFE_RELEASE(pAudioClient)
 	SAFE_RELEASE(pCaptureClient)
+	if (hr) {
+		sprintf_s(Log(), "send audio error %X", hr);
+		InvalidateRect(hWnd, NULL, TRUE);
+		if (IsConnected(m_clientAudioSocket))
+			Close(m_clientAudioSocket, SD_SEND);
+	}
+}
 
+HRESULT LoadAudioData(UINT nFrames, BYTE* pData, int inflate)
+{
+	float* frame = (float*)pData;
+	static float value = 0;
+	for (UINT32 i = 0; i < nFrames; i+= inflate)
+	{
+		SAMPLE sample;// = (SAMPLE)(0.5 * sampleMax * sin(i *3.14));
+		//if (true)
+		if (read(m_clientAudioSocket, sample)) 
+		{
+			float dv = (sample / sampleMax - value) / inflate;
+			for (int j = 0; j < inflate && i+j < nFrames; j++)
+			{
+				value += dv;
+				*frame++ = value;
+				*frame++ = value;
+			}
+		}
+		else
+			return -1;
+	}
+	return S_OK;
+}
+
+void PlayAudio(LPVOID p)
+{
+	HWND hWnd = (HWND)p;
+	HRESULT hr;
+	REFERENCE_TIME hnsRequestedDuration = REFTIMES_PER_SEC;
+	REFERENCE_TIME hnsActualDuration;
+	IMMDeviceEnumerator *pEnumerator = NULL;
+	IMMDevice *pDevice = NULL;
+	IAudioClient *pAudioClient = NULL;
+	IAudioRenderClient *pRenderClient = NULL;
+	WAVEFORMATEX *pwfx = NULL;
+	UINT32 bufferFrameCount;
+	UINT32 numFramesAvailable;
+	UINT32 numFramesPadding;
+	BYTE *pData;
+	DWORD flags = 0;
+
+	short sampleRate;
+	if (!read(m_clientAudioSocket, sampleRate))
+		return;
+
+	hr = CoCreateInstance(
+		CLSID_MMDeviceEnumerator, NULL,
+		CLSCTX_ALL, IID_IMMDeviceEnumerator,
+		(void**)&pEnumerator);
+	EXIT_ON_ERROR(hr)
+
+	hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
+	EXIT_ON_ERROR(hr)
+
+	hr = pDevice->Activate(
+			IID_IAudioClient, CLSCTX_ALL,
+			NULL, (void**)&pAudioClient);
+
+	EXIT_ON_ERROR(hr)
+
+	hr = pAudioClient->GetMixFormat(&pwfx);
+	EXIT_ON_ERROR(hr)
+
+	sprintf_s(Log(), "receivng at %d Hz", sampleRate);
+	LogFormat(pwfx, hWnd);
+
+	int inflate = pwfx->nSamplesPerSec / sampleRate;
+
+	hr = pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, hnsRequestedDuration, 0, pwfx, NULL);
+	EXIT_ON_ERROR(hr)
+
+	// Tell the audio source which format to use.
+	//hr = pMySource->SetFormat(pwfx);
+	EXIT_ON_ERROR(hr)
+
+	// Get the actual size of the allocated buffer.
+	hr = pAudioClient->GetBufferSize(&bufferFrameCount);
+	EXIT_ON_ERROR(hr)
+
+	hr = pAudioClient->GetService(IID_IAudioRenderClient, (void**)&pRenderClient);
+	EXIT_ON_ERROR(hr)
+
+	// Grab the entire buffer for the initial fill operation.
+	//hr = pRenderClient->GetBuffer(bufferFrameCount, &pData);
+	//EXIT_ON_ERROR(hr)
+
+	// Load the initial data into the shared buffer.
+	//hr = LoadAudioData(bufferFrameCount, pData);
+	//EXIT_ON_ERROR(hr)
+
+	//hr = pRenderClient->ReleaseBuffer(bufferFrameCount, flags);
+	//EXIT_ON_ERROR(hr)
+
+		// Calculate the actual duration of the allocated buffer.
+	hnsActualDuration = REFTIMES_PER_SEC *	bufferFrameCount / pwfx->nSamplesPerSec;
+
+	hr = pAudioClient->Start();  // Start playing.
+	EXIT_ON_ERROR(hr)
+
+	// Each loop fills about half of the shared buffer.
+	while (IsConnected(m_clientAudioSocket))
+	{
+		// Sleep for half the buffer duration.
+		Sleep((DWORD)(hnsActualDuration / REFTIMES_PER_MILLISEC / 8));
+
+		// See how much buffer space is available.
+		hr = pAudioClient->GetCurrentPadding(&numFramesPadding);
+		EXIT_ON_ERROR(hr)
+
+		numFramesAvailable = bufferFrameCount - numFramesPadding;
+
+		// Grab all the available space in the shared buffer.
+		hr = pRenderClient->GetBuffer(numFramesAvailable, &pData);
+		EXIT_ON_ERROR(hr)
+
+		hr = LoadAudioData(numFramesAvailable, pData, inflate);
+		EXIT_ON_ERROR(hr)
+
+		hr = pRenderClient->ReleaseBuffer(numFramesAvailable, flags);
+		EXIT_ON_ERROR(hr)
+	}
+
+	// Wait for last data in buffer to play before stopping.
+	Sleep((DWORD)(hnsActualDuration / REFTIMES_PER_MILLISEC / 2));
+
+	hr = pAudioClient->Stop();  // Stop playing.
+	EXIT_ON_ERROR(hr)
+
+Exit:
+	CoTaskMemFree(pwfx);
+	SAFE_RELEASE(pEnumerator)
+	SAFE_RELEASE(pDevice)
+	SAFE_RELEASE(pAudioClient)
+	SAFE_RELEASE(pRenderClient)
+	if (hr) {
+		sprintf_s(Log(), "play audio error %X", hr);
+		InvalidateRect(hWnd, NULL, TRUE);
+		if (IsConnected(m_clientAudioSocket))
+			Close(m_clientAudioSocket, SD_RECEIVE);
+	}
 }
 
 void ReceiveAudio(LPVOID p)
 {
 	while (m_running) {
-		if (IsSocketDisconnected(m_clientAudioSocket)) {
-			if (Accept(m_clientAudioSocket, m_listenAudioSocket) == S_OK)
+		if (IsDisconnected(m_clientAudioSocket)) {
+			if (m_sendAudio && Accept(m_clientAudioSocket, m_listenAudioSocket) == S_OK)
 				_beginthread(SendAudio, 0, p);
 		}
 		else {
-			char buffer[512];
-			ReadBytes(m_clientAudioSocket, buffer, sizeof(buffer));
-			//ReadAudio();
+			if (m_playAudio)
+				PlayAudio(p);
 		}			
+		Sleep(50);
 	}
 }
 #endif
@@ -784,16 +1058,23 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
 	if (InitSocketSystem() != S_OK)
 		return FALSE;
 
+
+#ifdef REMOTE_AUDIO
+	if (CoInitializeEx(0, COINIT_MULTITHREADED) != S_OK)
+		return FALSE;
+
+	if (InitSocket(m_listenAudioSocket, 18081) != S_OK)
+		return FALSE;
+
+	_beginthread(ReceiveAudio, 0, hWnd);
+#endif
+
 	if (InitSocket(m_listenScreenSocket, 18080) != S_OK)
 		return FALSE;
 
 	_beginthread(ReceiveDesktopControl, 0, hWnd);
 	_beginthread(SendScreen, 0, hWnd);
 
-#ifdef REMOTE_AUDIO
-	if (InitSocket(m_listenAudioSocket, 18081) == S_OK && CoInitializeEx(0, COINIT_MULTITHREADED) == S_OK)		
-		_beginthread(ReceiveAudio, 0, 0);
-#endif
 	return TRUE;
 }
 
@@ -820,7 +1101,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             case IDM_ABOUT:
                 DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
                 break;
-            case IDM_EXIT:
+			case IDM_SCREEN_CAPTURE:
+				m_captureScreen = true;
+				break;
+			case IDM_SCREEN_STOP:
+				m_captureScreen = false;
+				break;
+			case IDM_AUDIO_SEND:
+				m_sendAudio = true;
+				m_playAudio = false;
+				break;
+			case IDM_AUDIO_RECEIVE:
+				m_sendAudio = true;
+				m_playAudio = true;				
+				break;
+			case IDM_AUDIO_STOP:
+				m_sendAudio = false;
+				m_playAudio = false;
+				break;
+			case IDM_EXIT:
                 DestroyWindow(hWnd);
                 break;
             default:
@@ -856,28 +1155,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 #endif
 	case WM_DESTROY:
 		m_running = false;
-		if (m_clientScreenSocket != INVALID_SOCKET) {
-			shutdown(m_clientScreenSocket, SD_SEND);
-			m_clientScreenSocket = INVALID_SOCKET;
-		}
-		if (m_listenScreenSocket != INVALID_SOCKET) {
-			shutdown(m_listenScreenSocket, SD_RECEIVE);
-			m_listenScreenSocket = INVALID_SOCKET;
-		}
+		if (IsConnected(m_clientScreenSocket))
+			Close(m_clientScreenSocket, SD_SEND);
+		if (IsConnected(m_listenScreenSocket))
+			Close(m_listenScreenSocket, SD_RECEIVE);
 #ifdef REMOTE_AUDIO
-		if (m_clientAudioSocket != INVALID_SOCKET) {
-			shutdown(m_clientAudioSocket, SD_SEND);
-			m_clientAudioSocket = INVALID_SOCKET;
-		}
-		if (m_listenAudioSocket != INVALID_SOCKET) {
-			shutdown(m_listenAudioSocket, SD_RECEIVE);
-			m_listenAudioSocket = INVALID_SOCKET;
-		}
+		if (IsConnected(m_clientAudioSocket)) 
+			Close(m_clientAudioSocket, SD_SEND);
+		if (IsConnected(m_listenAudioSocket))
+			Close(m_listenAudioSocket, SD_RECEIVE);
 #endif
 		Sleep(100);
-		GlobalFree(m_screenDIB);
-		GlobalFree(m_screenBuffer);
-        PostQuitMessage(0);
+		if (m_screenDIB) GlobalFree(m_screenDIB);
+		if (m_screenDIBBuffer) free(m_screenDIBBuffer);
+		if (m_screenSendBuffer) free(m_screenSendBuffer);
+		PostQuitMessage(0);
         break;
     default:
         return DefWindowProc(hWnd, message, wParam, lParam);
