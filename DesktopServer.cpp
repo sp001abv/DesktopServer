@@ -649,9 +649,9 @@ void SendScreen(LPVOID p)
 			static DWORD s_sentFrames = 0;
 			LONGLONG tick = GetTickCount64();
 			CaptureScreen();
+			DWORD bps = (DWORD)(m_sentBytes - s_sentBytes);
 			if (tick - s_tick >= 1000)
 			{
-				DWORD bps = (DWORD)(m_sentBytes - s_sentBytes);
 				DWORD fps = m_sentFrames - s_sentFrames;
 				DWORD bpf = fps ? bps / fps : 0;
 				DWORD time = (DWORD)((tick - m_startTime) / 1000);
@@ -662,7 +662,9 @@ void SendScreen(LPVOID p)
 				s_sentFrames = m_sentFrames;
 				InvalidateRect(hWnd, NULL, TRUE);
 			}
-			DWORD frameTicks = 125;
+			DWORD frameTicks = bps >> 12;
+			if (frameTicks < 125)
+				frameTicks = 125;
 			DWORD ticks = (DWORD)(GetTickCount64() - tick);
 			if (ticks < frameTicks) {
 				Sleep(frameTicks - ticks);
