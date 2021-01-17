@@ -493,27 +493,6 @@ void InitScreenDC()
 	DrawTextA(m_screenMemoryDC, info, (int)strlen(info), &rc, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
 }
 
-inline void IndexColor(UINT& color, WORD* colors, BYTE& count)
-{
-	int index = 0xFF;
-	for (int i = 0; i < count; i++)
-	{
-		if (color == colors[i])
-		{
-			index = i;
-			break;
-		}
-	}
-	if (index == 0xFF && count < 126)
-	{
-		index = count++;
-		colors[index] = color;		
-	}
-	if (index != 0xFF)
-	{
-		color = 0xFF | index;
-	}
-}
 
 bool GetScreenBuffer()
 {
@@ -560,8 +539,7 @@ bool GetScreenBuffer()
 			if (color != skip)
 			{
 				updatedPixels += n;
-				if ((color & 0x8000) == 0)
-					buffer[index++] = color >> 8;
+				buffer[index++] = color >> 8;
 			}
 			buffer[index++] = color;
 			n = 0;
