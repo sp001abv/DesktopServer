@@ -493,6 +493,28 @@ void InitScreenDC()
 	DrawTextA(m_screenMemoryDC, info, (int)strlen(info), &rc, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
 }
 
+inline void IndexColor(UINT& color, WORD* colors, BYTE& count)
+{
+	int index = 0xFF;
+	for (int i = 0; i < count; i++)
+	{
+		if (color == colors[i])
+		{
+			index = i;
+			break;
+		}
+	}
+	if (index == 0xFF && count < 126)
+	{
+		index = count++;
+		colors[index] = color;		
+	}
+	if (index != 0xFF)
+	{
+		color = 0xFF | index;
+	}
+}
+
 bool GetScreenBuffer()
 {
 	UINT* screenDIB = (UINT*)GlobalLock(m_screenDIB);
@@ -508,7 +530,7 @@ bool GetScreenBuffer()
 	UINT color = skip;
 	HRESULT hr = S_OK;
 	int updatedPixels = 0;
-
+	
 	for (int i = 0; i < m_screenSize; i++)
 	{
 		UINT c = screenDIB[i];
@@ -522,17 +544,24 @@ bool GetScreenBuffer()
 		if ((c != color || i == m_screenSize - 1) && i > 0) {
 			if (n > 1 || color == skip) {
 				UINT t = n;
-				while (t) {
-					buffer[index++] = (t | 0x80) & 0xBF;
-					t >>= 6;
+				UINT bytes = 0;
+				BYTE b[4];
+				while (t > 0x1F) {
+					b[bytes++] = t;
+					t >>= 8;
 				};
+				buffer[index++] = (0x80 | (bytes << 5)) | t;
+				for (int j = bytes-1; j >= 0; j--)
+					buffer[index++] = b[j];
 			}
 			else n = 1;
 			size += n;
+			
 			if (color != skip)
 			{
 				updatedPixels += n;
-				buffer[index++] = color >> 8;
+				if ((color & 0x8000) == 0)
+					buffer[index++] = color >> 8;
 			}
 			buffer[index++] = color;
 			n = 0;
@@ -550,7 +579,7 @@ bool GetScreenBuffer()
 }
 
 void SendScreenBuffer()
-{
+{		
 	SendBytes(m_clientScreenSocket, m_screenSendBuffer, m_screenSendBufferSize);
 	m_sentFrames++;
 }
@@ -642,11 +671,11 @@ void SendScreen(LPVOID p)
 			static DWORD s_sentFrames = 0;
 			LONGLONG tick = GetTickCount64();
 			CaptureScreen();
-			DWORD bps = (DWORD)(m_sentBytes - s_sentBytes);
-			DWORD fps = m_sentFrames - s_sentFrames;
-			DWORD bpf = fps ? bps / fps : 0;
 			if (tick - s_tick >= 1000)
 			{
+				DWORD bps = (DWORD)(m_sentBytes - s_sentBytes);
+				DWORD fps = m_sentFrames - s_sentFrames;
+				DWORD bpf = fps ? bps / fps : 0;
 				DWORD time = (DWORD)((tick - m_startTime) / 1000);
 				sprintf_s(m_szText, "pixels %5.3fM sent %5.3fMB received %5.3fMB frames %d time %02d:%02d bpf %d bps %d fps %d",
 					(float)m_updatedPixels/(1000*1000), (float)m_sentBytes/ (float)(1024 *1024), (float)m_receivedBytes/(float)(1024*1024), m_sentFrames, time/60, time%60, bpf, bps, fps);
@@ -655,9 +684,7 @@ void SendScreen(LPVOID p)
 				s_sentFrames = m_sentFrames;
 				InvalidateRect(hWnd, NULL, TRUE);
 			}
-			DWORD frameTicks = bpf / 500;
-			if (frameTicks < 125)
-				frameTicks = 125;
+			DWORD frameTicks = 125;
 			DWORD ticks = (DWORD)(GetTickCount64() - tick);
 			if (ticks < frameTicks) {
 				Sleep(frameTicks - ticks);
