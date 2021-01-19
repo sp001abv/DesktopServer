@@ -507,23 +507,27 @@ inline UINT GetColor(const UINT& screenDIB, UINT& screenBuffer)
 
 inline void PutColor(const UINT& n, const UINT& color, UCHAR* buffer, UINT& index)
 {
-	UINT t = n;
-	UINT bytes = 0;
-	BYTE b[4];
-	while (t > 0x0F) {
-		b[bytes++] = t;
-		t >>= 8;
-	};
-	buffer[index++] = (color == skip ? 0xC0 : 0x80) | (bytes << 4) | t;
-	for (int j = bytes - 1; j >= 0; j--)
-		buffer[index++] = b[j];
+	if (n > 1 || color == skip)
+	{
+		UINT t = n;
+		UINT bytes = 0;
+		BYTE b[4];
+		while (t > 0x0F) {
+			b[bytes++] = t;
+			t >>= 8;
+		};
+		buffer[index++] = (color == skip ? 0xC0 : 0x80) | (bytes << 4) | t;
+		for (int j = bytes - 1; j >= 0; j--)
+			buffer[index++] = b[j];
+	}
+	if (color != skip)
+	{
+		buffer[index++] = color >> 8;
+		buffer[index++] = color;
+		m_updatedPixels += n;
+	}
 }
 
-inline void PutColor(const UINT& color, UCHAR* buffer, UINT& index)
-{
-	buffer[index++] = color >> 8;
-	buffer[index++] = color;
-}
 
 bool UpdateScreenBuffer()
 {
@@ -534,7 +538,7 @@ bool UpdateScreenBuffer()
 
 	UCHAR* buffer = m_screenSendBuffer;
 	UINT index = 0, n = 0, c;
-	int i, updatedPixels = 0;
+	int i, updatedPixels = m_updatedPixels;
 	int& start = m_screenUpdateStartIndex;
 	
 	UINT color = GetColor(screenDIB[start], screenBuffer[start]);
@@ -544,13 +548,7 @@ bool UpdateScreenBuffer()
 		n++;
 		c = GetColor(screenDIB[i], screenBuffer[i]);
 		if (c != color) {
-			if (n > 1 || color == skip)
-				PutColor(n, color, buffer, index);
-			if (color != skip)
-			{
-				PutColor(color, buffer, index);
-				updatedPixels += n;
-			}
+			PutColor(n, color, buffer, index);	
 			if (index > 64 * 1024)
 			{
 				n = m_screenSize - i - 1;
@@ -561,19 +559,14 @@ bool UpdateScreenBuffer()
 			color = c; n = 0;
 		}
 	}
-	if (n > 0)
-	{
-		if (n > 1 || color == skip)	PutColor(n, color, buffer, index);
-		if (color != skip) PutColor(color, buffer, index);
-	}
+	if (n > 0) PutColor(n, color, buffer, index);
 	if (i == m_screenSize) start = 0;
 
 	GlobalUnlock(m_screenDIB);
 
 	m_screenSendBufferSize = index;
-	m_updatedPixels += updatedPixels;
 
-	return updatedPixels > 0;
+	return m_updatedPixels != updatedPixels;
 }
 
 void SendScreenBuffer()
