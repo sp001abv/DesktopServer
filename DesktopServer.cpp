@@ -505,7 +505,7 @@ inline UINT GetColor(const UINT& screenDIB, UINT& screenBuffer)
 	return c;
 }
 
-inline void PutColor(const UINT& n, const UINT& color, UCHAR* buffer, UINT& index)
+inline void PutColor(const UINT& n, const UINT& color, UCHAR* buffer, UINT& index, UINT& updatedPixels)
 {
 	if (n > 1 || color == skip)
 	{
@@ -524,7 +524,7 @@ inline void PutColor(const UINT& n, const UINT& color, UCHAR* buffer, UINT& inde
 	{
 		buffer[index++] = color >> 8;
 		buffer[index++] = color;
-		m_updatedPixels += n;
+		updatedPixels += n;
 	}
 }
 
@@ -537,19 +537,20 @@ bool UpdateScreenBuffer()
 	GetScreenDIB(screenDIB);
 
 	UCHAR* buffer = m_screenSendBuffer;
-	UINT index = 0, n = 0, c;
-	int i, updatedPixels = m_updatedPixels;
+	UINT c, index = 0, n = 0, updatedPixels = 0;
+	UINT limit = m_sendAudio ? (64 * 1024) : (128 * 1024);
+	int i;
 	int& start = m_screenUpdateStartIndex;
 	
 	UINT color = GetColor(screenDIB[start], screenBuffer[start]);
-	if (start > 0) PutColor(start, skip, buffer, index);		
+	if (start > 0) PutColor(start, skip, buffer, index, updatedPixels);
 	for (i = start + 1; i < m_screenSize; i++)
 	{
 		n++;
 		c = GetColor(screenDIB[i], screenBuffer[i]);
 		if (c != color) {
-			PutColor(n, color, buffer, index);	
-			if (index > 64 * 1024)
+			PutColor(n, color, buffer, index, updatedPixels);
+			if (index > limit)
 			{
 				n = m_screenSize - i - 1;
 				color = skip;
@@ -559,14 +560,15 @@ bool UpdateScreenBuffer()
 			color = c; n = 0;
 		}
 	}
-	if (n > 0) PutColor(n, color, buffer, index);
+	if (n > 0) PutColor(n, color, buffer, index, updatedPixels);
 	if (i == m_screenSize) start = 0;
 
 	GlobalUnlock(m_screenDIB);
 
 	m_screenSendBufferSize = index;
+	m_updatedPixels += updatedPixels;
 
-	return m_updatedPixels != updatedPixels;
+	return updatedPixels > 0;
 }
 
 void SendScreenBuffer()
