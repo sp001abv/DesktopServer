@@ -104,6 +104,7 @@ HANDLE m_screenDIB = NULL;
 UINT* m_screenDIBBuffer = NULL;
 UCHAR* m_screenSendBuffer = NULL;
 int m_screenSendBufferSize = 0;
+int m_screenUpdateStartIndex = 0;
 int m_screenWidth = 0;
 int m_screenHeight = 0;
 int m_screenSize = m_screenWidth * m_screenHeight;
@@ -493,60 +494,79 @@ void InitScreenDC()
 	DrawTextA(m_screenMemoryDC, info, (int)strlen(info), &rc, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
 }
 
+const UINT skip = 0xFFFF;
+inline UINT GetColor(const UINT& screenDIB, UINT& screenBuffer)
+{
+	UINT c = (screenDIB & 0xF80000) >> 9 | (screenDIB & 0xF800) >> 6 | (screenDIB & 0xF8) >> 3;
+	if (screenBuffer != c)
+		screenBuffer = c;
+	else
+		c = skip;
+	return c;
+}
 
-bool GetScreenBuffer()
+inline void PutColor(const UINT& n, const UINT& color, UCHAR* buffer, UINT& index)
+{
+	UINT t = n;
+	UINT bytes = 0;
+	BYTE b[4];
+	while (t > 0x0F) {
+		b[bytes++] = t;
+		t >>= 8;
+	};
+	buffer[index++] = (color == skip ? 0xC0 : 0x80) | (bytes << 4) | t;
+	for (int j = bytes - 1; j >= 0; j--)
+		buffer[index++] = b[j];
+}
+
+inline void PutColor(const UINT& color, UCHAR* buffer, UINT& index)
+{
+	buffer[index++] = color >> 8;
+	buffer[index++] = color;
+}
+
+bool UpdateScreenBuffer()
 {
 	UINT* screenDIB = (UINT*)GlobalLock(m_screenDIB);
 	UINT* screenBuffer = m_screenDIBBuffer;
 
 	GetScreenDIB(screenDIB);
 
-	const UINT skip = 0xFFFF;
 	UCHAR* buffer = m_screenSendBuffer;
-	UINT index = 0;
-	UINT n = 0;
-	UINT size = 0;
-	UINT color = skip;
-	HRESULT hr = S_OK;
-	int updatedPixels = 0;
+	UINT index = 0, n = 0, c;
+	int i, updatedPixels = 0;
+	int& start = m_screenUpdateStartIndex;
 	
-	for (int i = 0; i < m_screenSize; i++)
+	UINT color = GetColor(screenDIB[start], screenBuffer[start]);
+	if (start > 0) PutColor(start, skip, buffer, index);		
+	for (i = start + 1; i < m_screenSize; i++)
 	{
-		UINT c = screenDIB[i];
-		c = (c & 0xF80000) >> 9 | (c & 0xF800) >> 6 | (c & 0xF8) >> 3;
-		if (screenBuffer[i] != c) {
-			screenBuffer[i] = c;
-		}
-		else {
-			c = skip;
-		}
-		if ((c != color || i == m_screenSize - 1) && i > 0) {
-			if (n > 1 || color == skip) {
-				UINT t = n;
-				UINT bytes = 0;
-				BYTE b[4];
-				while (t > 0x1F) {
-					b[bytes++] = t;
-					t >>= 8;
-				};
-				buffer[index++] = (0x80 | (bytes << 5)) | t;
-				for (int j = bytes-1; j >= 0; j--)
-					buffer[index++] = b[j];
-			}
-			else n = 1;
-			size += n;
-			
+		n++;
+		c = GetColor(screenDIB[i], screenBuffer[i]);
+		if (c != color) {
+			if (n > 1 || color == skip)
+				PutColor(n, color, buffer, index);
 			if (color != skip)
 			{
+				PutColor(color, buffer, index);
 				updatedPixels += n;
-				buffer[index++] = color >> 8;
 			}
-			buffer[index++] = color;
-			n = 0;
+			if (index > 64 * 1024)
+			{
+				n = m_screenSize - i - 1;
+				color = skip;
+				start = i;
+				break;
+			}
+			color = c; n = 0;
 		}
-		color = c;
-		n++;
 	}
+	if (n > 0)
+	{
+		if (n > 1 || color == skip)	PutColor(n, color, buffer, index);
+		if (color != skip) PutColor(color, buffer, index);
+	}
+	if (i == m_screenSize) start = 0;
 
 	GlobalUnlock(m_screenDIB);
 
@@ -575,13 +595,14 @@ void InitScreenCapture()
 
 	m_updatedPixels = m_sentBytes = m_receivedBytes = m_sentFrames = 0;
 	m_startTime = GetTickCount64();
+	m_screenUpdateStartIndex = 0;
 
 	if (!m_captureScreen)
 	{
 		InitScreenDC();
-		GetScreenBuffer();
+		UpdateScreenBuffer();
 		SendScreenBuffer();
-		GetScreenBuffer();
+		UpdateScreenBuffer();
 	}
 }
 
@@ -595,14 +616,14 @@ void CaptureScreen()
 		ReleaseDC(NULL, screenDC);
 		if (m_captureScreen)
 		{
-			screenUpdated = GetScreenBuffer();
+			screenUpdated = UpdateScreenBuffer();
 		}
 		else
 		{
 			InitScreenDC();
-			GetScreenBuffer();
+			UpdateScreenBuffer();
 			SendScreenBuffer();
-			GetScreenBuffer();
+			UpdateScreenBuffer();
 		}
 
 	}
@@ -649,9 +670,9 @@ void SendScreen(LPVOID p)
 			static DWORD s_sentFrames = 0;
 			LONGLONG tick = GetTickCount64();
 			CaptureScreen();
-			DWORD bps = (DWORD)(m_sentBytes - s_sentBytes);
 			if (tick - s_tick >= 1000)
 			{
+				DWORD bps = (DWORD)(m_sentBytes - s_sentBytes);
 				DWORD fps = m_sentFrames - s_sentFrames;
 				DWORD bpf = fps ? bps / fps : 0;
 				DWORD time = (DWORD)((tick - m_startTime) / 1000);
@@ -661,14 +682,8 @@ void SendScreen(LPVOID p)
 				s_sentBytes = m_sentBytes;
 				s_sentFrames = m_sentFrames;
 				InvalidateRect(hWnd, NULL, TRUE);
-			}
-			DWORD frameTicks = bps >> 12;
-			if (frameTicks < 125)
-				frameTicks = 125;
-			DWORD ticks = (DWORD)(GetTickCount64() - tick);
-			if (ticks < frameTicks) {
-				Sleep(frameTicks - ticks);
-			}
+			}			
+			Sleep(100);
 		}
 	}
 }
